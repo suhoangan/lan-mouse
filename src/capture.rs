@@ -339,6 +339,10 @@ impl CaptureTask {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
                 },
+                _ = tokio::time::sleep(Duration::from_millis(1500)), if self.state == State::WaitingForAck && self.active_client.is_some() => {
+                    log::warn!("connection to client timed out waiting for Ack, releasing capture");
+                    self.release_capture(capture).await?;
+                },
                 _ = self.cancellation_token.cancelled() => break,
             }
         }
