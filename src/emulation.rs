@@ -86,6 +86,7 @@ impl Emulation {
             emulation_proxy,
             request_rx,
             event_tx,
+            clipboard_assembler: Default::default(),
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -134,6 +135,7 @@ struct ListenTask {
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
+    clipboard_assembler: lan_mouse_proto::ClipboardAssembler,
 }
 
 impl ListenTask {
@@ -177,6 +179,12 @@ impl ListenTask {
                                 self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
+                            ProtoEvent::Clipboard { seq, total, len, data } => {
+                                if let Some(text) = self.clipboard_assembler.push(seq, total, len, &data) {
+                                    log::info!("received clipboard from {addr} ({} bytes)", text.len());
+                                    crate::clipboard::write_clipboard_text(&text);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -198,7 +206,15 @@ impl ListenTask {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::Release(addr) => {
+                        if let Some(text) = crate::clipboard::get_text_if_changed() {
+                            log::info!("syncing updated clipboard back to {addr} ({} bytes)", text.len());
+                            for chunk in ProtoEvent::clipboard_chunks(&text) {
+                                self.listener.reply(addr, chunk).await;
+                            }
+                        }
+                        self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+                    }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;

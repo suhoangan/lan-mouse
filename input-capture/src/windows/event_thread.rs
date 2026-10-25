@@ -109,6 +109,20 @@ fn try_send_event(
     EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().try_send((pos, event)))
 }
 
+fn flush_accumulated_motion(pos: Position) {
+    let (dx, dy) = ACCUMULATED_MOTION.get();
+    if dx != 0.0 || dy != 0.0 {
+        let event = CaptureEvent::Input(Event::Pointer(input_event::PointerEvent::Motion {
+            time: 0,
+            dx,
+            dy,
+        }));
+        if try_send_event(pos, event).is_ok() {
+            ACCUMULATED_MOTION.set((0.0, 0.0));
+        }
+    }
+}
+
 thread_local! {
     /// all configured clients
     static CLIENTS: RefCell<HashSet<Position>> = RefCell::new(HashSet::new());
@@ -122,6 +136,8 @@ thread_local! {
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// displays and generation counter
     static DISPLAYS: RefCell<(Vec<RECT>, i32)> = const { RefCell::new((Vec::new(), 0)) };
+    /// accumulated mouse motion delta when backpressure occurs
+    static ACCUMULATED_MOTION: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
 }
 
 fn get_msg() -> Option<MSG> {
@@ -230,6 +246,7 @@ fn start_routine(
                 x if x == RequestType::Exit as usize => break,
                 x if x == RequestType::Release as usize => {
                     ACTIVE_CLIENT.take();
+                    ACCUMULATED_MOTION.set((0.0, 0.0));
                 }
                 x if x == RequestType::ClientUpdate as usize => {
                     let requests = {
@@ -321,12 +338,33 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     let Some(pointer_event) = to_mouse_event(wparam, lparam) else {
         return LRESULT(1);
     };
-
-    /* notify mainthread (drop events if sending too fast) */
-    if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) {
-        log::warn!("e: {e}");
+    match pointer_event {
+        PointerEvent::Motion { time, dx, dy } => {
+            let (accum_dx, accum_dy) = ACCUMULATED_MOTION.get();
+            let total_dx = dx + accum_dx;
+            let total_dy = dy + accum_dy;
+            let event = CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                time,
+                dx: total_dx,
+                dy: total_dy,
+            }));
+            match try_send_event(pos, event) {
+                Ok(()) => {
+                    ACCUMULATED_MOTION.set((0.0, 0.0));
+                }
+                Err(e) => {
+                    ACCUMULATED_MOTION.set((total_dx, total_dy));
+                    log::warn!("mouse event queue full, accumulating motion delta: {e}");
+                }
+            }
+        }
+        other => {
+            flush_accumulated_motion(pos);
+            if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(other))) {
+                log::warn!("e: {e}");
+            }
+        }
     }
-
     /* don't pass event to applications */
     LRESULT(1)
 }
@@ -341,6 +379,7 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     let Some(key_event) = to_key_event(wparam, lparam) else {
         return LRESULT(1);
     };
+    flush_accumulated_motion(client);
 
     if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
         log::warn!("e: {e}");
@@ -428,6 +467,7 @@ fn update_clients(request: ClientUpdate) {
                 if pos == active_pos {
                     let _ = ACTIVE_CLIENT.take();
                 }
+                ACCUMULATED_MOTION.set((0.0, 0.0));
             }
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
         }

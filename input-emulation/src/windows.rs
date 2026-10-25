@@ -26,11 +26,17 @@ const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 
 pub(crate) struct WindowsEmulation {
     repeat_task: Option<AbortHandle>,
+    fractional_dx: f64,
+    fractional_dy: f64,
 }
 
 impl WindowsEmulation {
     pub(crate) fn new() -> Result<Self, WindowsEmulationCreationError> {
-        Ok(Self { repeat_task: None })
+        Ok(Self {
+            repeat_task: None,
+            fractional_dx: 0.0,
+            fractional_dy: 0.0,
+        })
     }
 }
 
@@ -40,7 +46,10 @@ impl Emulation for WindowsEmulation {
         match event {
             Event::Pointer(pointer_event) => match pointer_event {
                 PointerEvent::Motion { time: _, dx, dy } => {
-                    rel_mouse(dx as i32, dy as i32);
+                    let (int_dx, int_dy) = self.accumulate_motion(dx, dy);
+                    if int_dx != 0 || int_dy != 0 {
+                        rel_mouse(int_dx, int_dy);
+                    }
                 }
                 PointerEvent::Button {
                     time: _,
@@ -77,12 +86,29 @@ impl Emulation for WindowsEmulation {
 
     async fn create(&mut self, _handle: EmulationHandle) {}
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {}
+    async fn destroy(&mut self, _handle: EmulationHandle) {
+        self.fractional_dx = 0.0;
+        self.fractional_dy = 0.0;
+    }
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.kill_repeat_task();
+        self.fractional_dx = 0.0;
+        self.fractional_dy = 0.0;
+    }
 }
 
 impl WindowsEmulation {
+    pub(crate) fn accumulate_motion(&mut self, dx: f64, dy: f64) -> (i32, i32) {
+        let total_dx = dx + self.fractional_dx;
+        let total_dy = dy + self.fractional_dy;
+        let int_dx = total_dx.trunc() as i32;
+        let int_dy = total_dy.trunc() as i32;
+        self.fractional_dx = total_dx - (int_dx as f64);
+        self.fractional_dy = total_dy - (int_dy as f64);
+        (int_dx, int_dy)
+    }
+
     async fn spawn_repeat_task(&mut self, key: u32) {
         // there can only be one repeating key and it's
         // always the last to be pressed
@@ -235,4 +261,49 @@ fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
     };
     log::trace!("windows code: {windows_scancode:?}");
     Some(windows_scancode as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fractional_motion_accumulation() {
+        let mut emu = WindowsEmulation::new().unwrap();
+
+        // Sub-pixel moves at 1000 Hz: dx = 0.4 each
+        assert_eq!(emu.accumulate_motion(0.4, 0.0), (0, 0));
+        assert_eq!(emu.accumulate_motion(0.4, 0.0), (0, 0));
+        // 3rd event: total = 1.2 -> outputs 1, remainder 0.2
+        assert_eq!(emu.accumulate_motion(0.4, 0.0), (1, 0));
+        // 4th event: total = 0.6 -> outputs 0, remainder 0.6
+        assert_eq!(emu.accumulate_motion(0.4, 0.0), (0, 0));
+        // 5th event: total = 1.0 -> outputs 1, remainder 0.0
+        assert_eq!(emu.accumulate_motion(0.4, 0.0), (1, 0));
+        assert!((emu.fractional_dx.abs()) < 1e-6);
+    }
+
+    #[test]
+    fn test_negative_fractional_motion_accumulation() {
+        let mut emu = WindowsEmulation::new().unwrap();
+
+        assert_eq!(emu.accumulate_motion(-0.6, -0.4), (0, 0));
+        // total dx = -1.2 -> int_dx = -1, remainder -0.2
+        // total dy = -0.8 -> int_dy = 0, remainder -0.8
+        assert_eq!(emu.accumulate_motion(-0.6, -0.4), (-1, 0));
+        // total dy = -1.2 -> int_dy = -1, remainder -0.2
+        assert_eq!(emu.accumulate_motion(0.0, -0.4), (0, -1));
+    }
+
+    #[tokio::test]
+    async fn test_destroy_resets_fractional_deltas() {
+        let mut emu = WindowsEmulation::new().unwrap();
+        assert_eq!(emu.accumulate_motion(0.7, -0.7), (0, 0));
+        assert_ne!(emu.fractional_dx, 0.0);
+        assert_ne!(emu.fractional_dy, 0.0);
+
+        emu.destroy(0).await;
+        assert_eq!(emu.fractional_dx, 0.0);
+        assert_eq!(emu.fractional_dy, 0.0);
+    }
 }

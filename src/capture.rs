@@ -81,6 +81,7 @@ impl Capture {
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
             active_client: None,
+            clipboard_assembler: Default::default(),
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
@@ -165,6 +166,7 @@ macro_rules! debounce {
 
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
+    clipboard_assembler: lan_mouse_proto::ClipboardAssembler,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
@@ -291,12 +293,24 @@ impl CaptureTask {
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
+                            if let Some(text) = crate::clipboard::get_text_if_changed() {
+                                log::info!("syncing clipboard to client {handle} ({} bytes)", text.len());
+                                for chunk in ProtoEvent::clipboard_chunks(&text) {
+                                    let _ = self.conn.send(chunk, handle).await;
+                                }
+                            }
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
                         },
+                        ProtoEvent::Clipboard { seq, total, len, data } => {
+                            if let Some(text) = self.clipboard_assembler.push(seq, total, len, &data) {
+                                log::info!("received clipboard from client {handle} ({} bytes)", text.len());
+                                crate::clipboard::write_clipboard_text(&text);
+                            }
+                        }
                         _ => {}
                     }
                 },
