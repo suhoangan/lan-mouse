@@ -46,6 +46,14 @@ impl Display for Position {
 }
 
 /// main lan-mouse protocol event type
+///
+/// The clipboard variant carries a full chunk inline (see
+/// [`MAX_CLIPBOARD_CHUNK`]), which makes it far larger than the input
+/// variants. Keeping it inline is deliberate: `ProtoEvent` is `Copy`, and the
+/// send paths copy events freely. Boxing the chunk would drop `Copy` and
+/// ripple through every send site for no behavioural gain, so the size
+/// difference is accepted here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug)]
 pub enum ProtoEvent {
     /// notify a client that the cursor entered its region at the given position

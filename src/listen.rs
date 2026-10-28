@@ -36,7 +36,9 @@ type ArcConn = Arc<dyn Conn + Send + Sync>;
 
 pub(crate) enum ListenEvent {
     Msg {
-        event: ProtoEvent,
+        /// boxed: a clipboard chunk makes `ProtoEvent` far larger than the
+        /// other variants, and this enum is moved across a channel per event
+        event: Box<ProtoEvent>,
         addr: SocketAddr,
     },
     Accept {
@@ -277,7 +279,10 @@ async fn read_loop(
     while conn.recv(&mut b).await.is_ok() {
         match b.try_into() {
             Ok(event) => dtls_tx
-                .send(ListenEvent::Msg { event, addr })
+                .send(ListenEvent::Msg {
+                    event: Box::new(event),
+                    addr,
+                })
                 .expect("channel closed"),
             Err(e) => {
                 // Skip the malformed/unknown datagram and keep
