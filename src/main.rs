@@ -1,3 +1,10 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+#[cfg(windows)]
+extern "system" {
+    fn AttachConsole(dw_process_id: u32) -> i32;
+}
+
 use env_logger::Env;
 use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
@@ -41,6 +48,10 @@ enum LanMouseError {
 }
 
 fn main() {
+    #[cfg(windows)]
+    unsafe {
+        let _ = AttachConsole(0xFFFFFFFF);
+    }
     // init logging
     let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
     env_logger::init_from_env(env);
