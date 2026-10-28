@@ -25,15 +25,15 @@ use keycode::{KeyMap, KeyMapping};
 use libc::c_void;
 use once_cell::unsync::Lazy;
 use std::{
+    cell::Cell,
     collections::HashSet,
     ffi::{CString, c_char},
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll, ready},
     thread::{self},
 };
 use tokio::sync::{
-    Mutex,
     mpsc::{self, Receiver, Sender},
     oneshot,
 };
@@ -147,10 +147,7 @@ impl InputCaptureState {
         CGDisplay::show_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)
     }
 
-    async fn handle_producer_event(
-        &mut self,
-        producer_event: ProducerEvent,
-    ) -> Result<(), CaptureError> {
+    fn handle_producer_event(&mut self, producer_event: ProducerEvent) -> Result<(), CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
             ProducerEvent::Release => {
@@ -446,11 +443,22 @@ fn create_event_tap<'a>(
         CGEventType::FlagsChanged,
     ];
 
+    // Motion deltas that could not be enqueued because the runtime was behind.
+    // Coalesced into the next successful motion send so backpressure loses
+    // samples, never displacement. `Cell` because the tap requires `Fn`.
+    let accumulated_motion: Cell<(f64, f64)> = Cell::new((0.0, 0.0));
+
     let event_tap_callback = move |_proxy: CGEventTapProxy,
                                    event_type: CGEventType,
                                    cg_ev: &CGEvent| {
         log::trace!("Got event from tap: {event_type:?}");
-        let mut state = client_state.blocking_lock();
+        // Sync lock, never an async one: this callback runs on the tap thread
+        // and MUST NOT wait for the runtime. The producer task also takes this
+        // lock synchronously and fully releases it before awaiting anything.
+        let mut state = match client_state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let mut capture_position = None;
         let mut res_events = vec![];
 
@@ -496,8 +504,11 @@ fn create_event_tap<'a>(
                 state.current_pos = None;
             }
             notify_tx
-                .blocking_send(ProducerEvent::EventTapDisabled)
+                .try_send(ProducerEvent::EventTapDisabled)
                 .unwrap_or_else(|e| {
+                    // Never block the tap thread: a full queue means the
+                    // runtime is stalled, and blocking here makes macOS
+                    // disable the tap and freeze system input.
                     log::error!("Failed to send notification: {e}");
                 });
             return CallbackResult::Keep;
@@ -534,18 +545,47 @@ fn create_event_tap<'a>(
                     .start_capture(cg_ev, new_pos)
                     .unwrap_or_else(|e| log::warn!("{e}"));
                 res_events.push(CaptureEvent::Begin);
-                notify_tx
-                    .blocking_send(ProducerEvent::Grab(new_pos))
-                    .expect("Failed to send notification");
+                // A dropped `Grab` only delays hiding the cursor until the
+                // next crossing; blocking here would risk the tap timeout.
+                if let Err(e) = notify_tx.try_send(ProducerEvent::Grab(new_pos)) {
+                    log::warn!("failed to send grab notification: {e}");
+                }
             }
         }
 
         if let Some(pos) = capture_position {
-            res_events.iter().for_each(|e| {
-                // error must be ignored, since the event channel
-                // may already be closed when the InputCapture instance is dropped.
-                let _ = event_tx.blocking_send((pos, *e));
-            });
+            for e in res_events {
+                // Never block the tap thread. Dropping an individual motion
+                // sample under backpressure is invisible to the user; blocking
+                // here is what lets macOS disable the tap and freeze input.
+                let event = match e {
+                    CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy })) => {
+                        let (accum_dx, accum_dy) = accumulated_motion.get();
+                        CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                            time,
+                            dx: dx + accum_dx,
+                            dy: dy + accum_dy,
+                        }))
+                    }
+                    other => other,
+                };
+                match event_tx.try_send((pos, event)) {
+                    Ok(()) => accumulated_motion.set((0.0, 0.0)),
+                    Err(e) => {
+                        // keep the displacement for the next successful send
+                        if let CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                            dx,
+                            dy,
+                            ..
+                        })) = event
+                        {
+                            let (accum_dx, accum_dy) = accumulated_motion.get();
+                            accumulated_motion.set((accum_dx + dx, accum_dy + dy));
+                        }
+                        log::trace!("dropping capture event under backpressure: {e}");
+                    }
+                }
+            }
             // Returning Drop should stop the event from being processed
             // but core fundation still returns the event
             cg_ev.set_type(CGEventType::Null);
@@ -703,8 +743,11 @@ impl MacOSInputCapture {
                         let Some(producer_event) = producer_event else {
                             break;
                         };
-                        let mut state = state.lock().await;
-                        state.handle_producer_event(producer_event).await.unwrap_or_else(|e| {
+                        // sync lock: the mutex must not be held across an await,
+                        // and the event-tap thread must be able to take it
+                        // without waiting on the runtime.
+                        let mut state = state.lock().expect("capture state poisoned");
+                        state.handle_producer_event(producer_event).unwrap_or_else(|e| {
                             log::error!("Failed to handle producer event: {e}");
                         })
                     }

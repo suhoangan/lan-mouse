@@ -14,7 +14,8 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::clipboard::Clipboard;
+use crate::connect::{LanMouseConnection, LanMouseConnectionError};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -75,12 +76,14 @@ impl Capture {
         backend: Option<input_capture::Backend>,
         conn: LanMouseConnection,
         release_bind: Vec<scancode::Linux>,
+        clipboard: Clipboard,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
             active_client: None,
+            clipboard,
             clipboard_assembler: Default::default(),
             backend,
             cancellation_token: cancellation_token.clone(),
@@ -166,6 +169,7 @@ macro_rules! debounce {
 
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
+    clipboard: Clipboard,
     clipboard_assembler: lan_mouse_proto::ClipboardAssembler,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
@@ -301,7 +305,7 @@ impl CaptureTask {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
                             ack_deadline = None;
-                            if let Some(text) = crate::clipboard::get_text_if_changed() {
+                            if let Some(text) = self.clipboard.read_changed().await {
                                 log::info!("syncing clipboard to client {handle} ({} bytes)", text.len());
                                 for chunk in ProtoEvent::clipboard_chunks(&text) {
                                     let _ = self.conn.send(chunk, handle).await;
@@ -317,7 +321,7 @@ impl CaptureTask {
                         ProtoEvent::Clipboard { seq, total, len, data } => {
                             if let Some(text) = self.clipboard_assembler.push(seq, total, len, &data) {
                                 log::info!("received clipboard from client {handle} ({} bytes)", text.len());
-                                crate::clipboard::write_clipboard_text(&text);
+                                self.clipboard.write(text);
                             }
                         }
                         _ => {}
@@ -362,7 +366,12 @@ impl CaptureTask {
                     self.release_capture(capture).await?;
                     ack_deadline = None;
                 },
-                _ = self.cancellation_token.cancelled() => break,
+                _ = self.cancellation_token.cancelled() => {
+                    // Flush the release notice on shutdown so the peer drops any
+                    // held keys/modifiers instead of waiting for its watchdog.
+                    self.release_capture(capture).await?;
+                    break;
+                },
             }
         }
         Ok(())
@@ -420,13 +429,18 @@ impl CaptureTask {
         };
 
         if let Err(e) = self.conn.send(event, handle).await {
-            const DUR: Duration = Duration::from_millis(500);
-            debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            // Funnel through release_capture so the leave_hook
-            // fires and active_client is cleared (without this the
-            // active_client field would stay stale until the next
-            // Begin from a different handle).
-            self.release_capture(capture).await?;
+            // `NotConnected` means a background connect was just started: the
+            // session stays active and the ack deadline keeps running, so the
+            // first crossing on a cold connection works without a retry.
+            if !matches!(e, LanMouseConnectionError::NotConnected) {
+                const DUR: Duration = Duration::from_millis(500);
+                debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+                // Funnel through release_capture so the leave_hook
+                // fires and active_client is cleared (without this the
+                // active_client field would stay stale until the next
+                // Begin from a different handle).
+                self.release_capture(capture).await?;
+            }
         }
         Ok(())
     }
@@ -457,7 +471,7 @@ impl CaptureTask {
                     key: key as u32,
                     state: 0,
                 }));
-                if let Err(e) = self.conn.send(key_up, handle).await {
+                if let Err(e) = self.conn.send_if_connected(key_up, handle).await {
                     log::warn!("failed to send key-up to client {handle}: {e}");
                 }
             }
@@ -472,12 +486,16 @@ impl CaptureTask {
                 locked: 0,
                 group: 0,
             }));
-            if let Err(e) = self.conn.send(mods_zero, handle).await {
+            if let Err(e) = self.conn.send_if_connected(mods_zero, handle).await {
                 log::warn!("failed to reset modifiers on client {handle}: {e}");
             }
 
             log::info!("sending Leave event to client {handle}");
-            if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
+            if let Err(e) = self
+                .conn
+                .send_if_connected(ProtoEvent::Leave(0), handle)
+                .await
+            {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
         }

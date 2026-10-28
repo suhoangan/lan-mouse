@@ -52,6 +52,15 @@ Most current desktop environments and operating systems are fully supported, thi
 >
 > - **Windows**: The mouse cursor will be invisible when sending input to a Windows system if
 > there is no real mouse connected to the machine.
+>
+> - **Windows packaging**: The release build is a GUI binary and opens no console
+> window when started from Explorer or the Start menu. Started from a terminal, it
+> attaches to that terminal so logs stay visible.
+>
+> - **Peer authorization**: Approving a peer authorizes both directions. An outbound
+> connection to a configured client records that peer's fingerprint, so the peer can
+> connect back without a second approval. The outbound leg does not pin the
+> fingerprint — see [DOC.md](DOC.md#peer-authorization).
 
 For more detailed information about os support see [Detailed OS Support](#detailed-os-support)
 

@@ -75,3 +75,22 @@ This ensures that
 - b) As soon as a virtual input enters another client, lan-mouse will stop receiving events,
 which ensures clients can only be controlled directly and not indirectly through other clients.
 
+## Peer Authorization
+
+Each instance presents a self-signed certificate; the SHA-256 fingerprint is the
+peer's identity. Fingerprints live in `authorized_fingerprints` in the config
+and are what the listener checks for every inbound connection.
+
+Authorizing a peer on one machine covers both directions:
+
+- **Inbound** connections are accepted when the presented fingerprint is in
+  `authorized_fingerprints`. Unknown fingerprints are rejected and surfaced to
+  the user as a connection attempt to review.
+- **Outbound** connections to a client configured by the operator add that
+  peer's fingerprint to `authorized_fingerprints` once the handshake completes.
+  The peer can then connect back without a second approval.
+
+The outbound leg does not pin the fingerprint: it trusts whoever answers at the
+configured address and port. On a network where that address can be spoofed or
+reassigned, review the authorized list after connecting — a surprising entry
+means something other than the intended peer answered.

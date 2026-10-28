@@ -1,3 +1,4 @@
+use crate::clipboard::Clipboard;
 use crate::config::local_commit;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
@@ -77,6 +78,7 @@ impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
+        clipboard: Clipboard,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         let (request_tx, request_rx) = channel();
@@ -86,6 +88,7 @@ impl Emulation {
             emulation_proxy,
             request_rx,
             event_tx,
+            clipboard,
             clipboard_assembler: Default::default(),
         };
         let task = spawn_local(emulation_task.run());
@@ -135,6 +138,7 @@ struct ListenTask {
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
+    clipboard: Clipboard,
     clipboard_assembler: lan_mouse_proto::ClipboardAssembler,
 }
 
@@ -182,7 +186,7 @@ impl ListenTask {
                             ProtoEvent::Clipboard { seq, total, len, data } => {
                                 if let Some(text) = self.clipboard_assembler.push(seq, total, len, &data) {
                                     log::info!("received clipboard from {addr} ({} bytes)", text.len());
-                                    crate::clipboard::write_clipboard_text(&text);
+                                    self.clipboard.write(text);
                                 }
                             }
                             _ => {}
@@ -207,7 +211,7 @@ impl ListenTask {
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => {
-                        if let Some(text) = crate::clipboard::get_text_if_changed() {
+                        if let Some(text) = self.clipboard.read_changed().await {
                             log::info!("syncing updated clipboard back to {addr} ({} bytes)", text.len());
                             for chunk in ProtoEvent::clipboard_chunks(&text) {
                                 self.listener.reply(addr, chunk).await;

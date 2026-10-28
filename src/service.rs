@@ -67,6 +67,10 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// fingerprints newly authorized by an outbound connection
+    authorized_rx: local_channel::mpsc::Receiver<String>,
+    /// set once `authorized_rx` closes, so the select branch stops polling it
+    authorized_rx_closed: bool,
 }
 
 #[derive(Debug)]
@@ -94,13 +98,26 @@ impl Service {
         // listener + connection
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+        let (authorized_tx, authorized_rx) = local_channel::mpsc::channel();
+        let conn = LanMouseConnection::new(
+            cert.clone(),
+            client_manager.clone(),
+            authorized_keys.clone(),
+            authorized_tx,
+        );
 
-        // input capture + emulation
+        // input capture + emulation. One clipboard instance is shared so the
+        // echo-suppression state is consistent across both directions.
+        let clipboard = crate::clipboard::Clipboard::new();
         let capture_backend = config.capture_backend().map(|b| b.into());
-        let capture = Capture::new(capture_backend, conn, config.release_bind());
+        let capture = Capture::new(
+            capture_backend,
+            conn,
+            config.release_bind(),
+            clipboard.clone(),
+        );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener);
+        let emulation = Emulation::new(emulation_backend, listener, clipboard);
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -123,6 +140,8 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            authorized_rx,
+            authorized_rx_closed: false,
         };
         Ok(service)
     }
@@ -142,13 +161,31 @@ impl Service {
 
         loop {
             tokio::select! {
-                request = self.frontend_listener.next() => self.handle_frontend_request(request),
+                request = self.frontend_listener.next() => {
+                    if !self.handle_frontend_request(request) { break; }
+                },
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
-                r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
+                r = signal::ctrl_c() => {
+                    if let Err(e) = r {
+                        log::warn!("failed to wait for CTRL+C: {e}");
+                    }
+                    log::info!("received CTRL+C, shutting down");
+                    break;
+                },
+                _ = crate::terminate::terminate_requested() => break,
+                // disabled after closure: a closed receiver yields `None`
+                // immediately, which would spin the loop
+                fp = self.authorized_rx.recv(), if !self.authorized_rx_closed => match fp {
+                    Some(fp) => self.handle_authorized_peer(fp),
+                    None => {
+                        log::warn!("authorized-peer channel closed");
+                        self.authorized_rx_closed = true;
+                    }
+                },
             }
         }
 
@@ -163,10 +200,23 @@ impl Service {
         Ok(())
     }
 
-    fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {
-        let request = match request.expect("frontend listener closed") {
+    /// Returns `false` when the frontend went away and the service must stop.
+    fn handle_frontend_request(
+        &mut self,
+        request: Option<Result<FrontendRequest, IpcError>>,
+    ) -> bool {
+        // A closed frontend means the GUI exited: nothing else can drive the
+        // service, so return and let the normal shutdown path notify the peer.
+        let Some(request) = request else {
+            log::info!("frontend disconnected, shutting down");
+            return false;
+        };
+        let request = match request {
             Ok(r) => r,
-            Err(e) => return log::error!("error receiving request: {e}"),
+            Err(e) => {
+                log::error!("error receiving request: {e}");
+                return true;
+            }
         };
         match request {
             FrontendRequest::Activate(handle, active) => {
@@ -219,6 +269,7 @@ impl Service {
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
         }
+        true
     }
 
     fn save_config(&mut self) {
@@ -460,6 +511,12 @@ impl Service {
     fn notify_frontend(&mut self, event: FrontendEvent) {
         self.pending_frontend_events.push_back(event);
         self.frontend_event_pending.notify_one();
+    }
+
+    /// Persist and surface a fingerprint authorized by an outbound connection.
+    fn handle_authorized_peer(&mut self, fp: String) {
+        self.add_authorized_key("outgoing peer".to_owned(), fp);
+        self.save_config();
     }
 
     fn add_authorized_key(&mut self, desc: String, fp: String) {

@@ -35,6 +35,11 @@ mod dummy;
 
 pub type CaptureHandle = u64;
 
+/// Upper bound on backend events consumed inside a single `poll_next` call.
+/// Events for positions without a registered handle are dropped in place; the
+/// bound keeps such a stream from monopolizing the executor in one poll.
+const MAX_EVENTS_PER_POLL: usize = 64;
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum CaptureEvent {
     /// capture on this capture handle is now active
@@ -224,55 +229,71 @@ impl Stream for InputCapture {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        if let Some(e) = self.pending.pop_front() {
-            return Poll::Ready(Some(Ok(e)));
-        }
+        // Events for positions whose capture was destroyed are dropped and the
+        // backend is polled again in this same call. Returning `Pending` after
+        // consuming such an event would leave the stream parked with no waker
+        // registered, stalling the capture task forever.
+        for _ in 0..MAX_EVENTS_PER_POLL {
+            if let Some(e) = self.pending.pop_front() {
+                return Poll::Ready(Some(Ok(e)));
+            }
 
-        // ready
-        let event = ready!(self.capture.poll_next_unpin(cx));
+            // no event pending in the backend: register the waker and suspend
+            let event = ready!(self.capture.poll_next_unpin(cx));
 
-        // stream closed
-        let event = match event {
-            Some(e) => e,
-            None => return Poll::Ready(None),
-        };
+            // stream closed
+            let event = match event {
+                Some(e) => e,
+                None => return Poll::Ready(None),
+            };
 
-        // error occurred
-        let (pos, event) = match event {
-            Ok(e) => e,
-            Err(e) => return Poll::Ready(Some(Err(e))),
-        };
+            // error occurred
+            let (pos, event) = match event {
+                Ok(e) => e,
+                Err(e) => return Poll::Ready(Some(Err(e))),
+            };
 
-        // handle key presses
-        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = event {
-            self.update_pressed_keys(key, state);
-        }
+            // handle key presses
+            if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) =
+                event
+            {
+                self.update_pressed_keys(key, state);
+            }
 
-        let len = self
-            .position_map
-            .get(&pos)
-            .map(|ids| ids.len())
-            .unwrap_or(0);
+            let len = self
+                .position_map
+                .get(&pos)
+                .map(|ids| ids.len())
+                .unwrap_or(0);
 
-        match len {
-            0 => Poll::Pending,
-            1 => Poll::Ready(Some(Ok((
-                self.position_map.get(&pos).expect("no id")[0],
-                event,
-            )))),
-            _ => {
-                let mut position_map = HashMap::new();
-                swap(&mut self.position_map, &mut position_map);
-                {
-                    for &id in position_map.get(&pos).expect("position") {
-                        self.pending.push_back((id, event));
-                    }
+            match len {
+                // no handle registered at this position (anymore): drop the
+                // event and keep going instead of suspending
+                0 => continue,
+                1 => {
+                    return Poll::Ready(Some(Ok((
+                        self.position_map.get(&pos).expect("no id")[0],
+                        event,
+                    ))));
                 }
-                swap(&mut self.position_map, &mut position_map);
+                _ => {
+                    let mut position_map = HashMap::new();
+                    swap(&mut self.position_map, &mut position_map);
+                    {
+                        for &id in position_map.get(&pos).expect("position") {
+                            self.pending.push_back((id, event));
+                        }
+                    }
+                    swap(&mut self.position_map, &mut position_map);
 
-                Poll::Ready(Some(Ok(self.pending.pop_front().expect("event"))))
+                    return Poll::Ready(Some(Ok(self.pending.pop_front().expect("event"))));
+                }
             }
         }
+
+        // yield to the executor and get polled again
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -348,4 +369,138 @@ async fn create(
         }
     }
     Err(CaptureCreationError::NoAvailableBackend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Wake, Waker};
+
+    /// backend replaying a fixed script of events, then ending the stream
+    struct ScriptedCapture {
+        events: VecDeque<Result<(Position, CaptureEvent), CaptureError>>,
+    }
+
+    impl ScriptedCapture {
+        fn new(events: Vec<(Position, CaptureEvent)>) -> Self {
+            Self {
+                events: events.into_iter().map(Ok).collect(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Capture for ScriptedCapture {
+        async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn destroy(&mut self, _pos: Position) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn release(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn terminate(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+    }
+
+    impl Stream for ScriptedCapture {
+        type Item = Result<(Position, CaptureEvent), CaptureError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            match self.events.pop_front() {
+                Some(e) => Poll::Ready(Some(e)),
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    fn capture_with(events: Vec<(Position, CaptureEvent)>) -> InputCapture {
+        InputCapture {
+            capture: Box::new(ScriptedCapture::new(events)),
+            pressed_keys: HashSet::new(),
+            position_map: Default::default(),
+            id_map: Default::default(),
+            pending: Default::default(),
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingWaker(AtomicBool);
+
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// An event for a position with no handle must not park the stream: it is
+    /// dropped and the following event is delivered in the same poll.
+    #[test]
+    fn event_without_handle_does_not_stall_the_stream() {
+        let mut capture = capture_with(vec![
+            (Position::Right, CaptureEvent::Begin),
+            (Position::Right, CaptureEvent::Begin),
+            (Position::Left, CaptureEvent::Begin),
+        ]);
+        capture.id_map.insert(7, Position::Left);
+        capture.position_map.insert(Position::Left, vec![7]);
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let polled = Stream::poll_next(std::pin::Pin::new(&mut capture), &mut cx);
+
+        assert!(
+            matches!(polled, Poll::Ready(Some(Ok((7, CaptureEvent::Begin))))),
+            "event for a handle-less position must be skipped, not suspend the stream"
+        );
+    }
+
+    /// A backend that keeps supplying handle-less events must eventually yield
+    /// the executor, and must arrange to be polled again.
+    #[test]
+    fn handle_less_event_flood_yields_but_stays_wakeable() {
+        let events = (0..MAX_EVENTS_PER_POLL + 10)
+            .map(|_| (Position::Right, CaptureEvent::Begin))
+            .collect();
+        let mut capture = capture_with(events);
+
+        let waker = Arc::new(CountingWaker::default());
+        let waker_handle = Waker::from(waker.clone());
+        let mut cx = Context::from_waker(&waker_handle);
+        let polled = Stream::poll_next(std::pin::Pin::new(&mut capture), &mut cx);
+
+        assert!(
+            matches!(polled, Poll::Pending),
+            "poll must yield to the executor"
+        );
+        assert!(
+            waker.0.load(Ordering::SeqCst),
+            "the stream must wake itself so it is polled again"
+        );
+    }
+
+    /// The delivered event for a registered handle is still routed to it.
+    #[test]
+    fn event_with_handle_is_delivered() {
+        let mut capture = capture_with(vec![(Position::Bottom, CaptureEvent::Begin)]);
+        capture.id_map.insert(3, Position::Bottom);
+        capture.position_map.insert(Position::Bottom, vec![3]);
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let polled = Stream::poll_next(std::pin::Pin::new(&mut capture), &mut cx);
+
+        assert!(matches!(
+            polled,
+            Poll::Ready(Some(Ok((3, CaptureEvent::Begin))))
+        ));
+    }
 }

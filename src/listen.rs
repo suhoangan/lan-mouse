@@ -119,59 +119,80 @@ impl LanMouseListener {
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
             let connection_attempts = connection_attempts.clone();
+            // Workaround for https://github.com/webrtc-rs/webrtc/issues/614:
+            // a periodic tick keeps the accept loop from starving the executor.
+            // The `accept()` future lives across ticks instead of being dropped
+            // on each one, which would abort an in-flight DTLS handshake — a
+            // peer waking from sleep would have to start over every 2 seconds.
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
             spawn_local(async move {
                 loop {
-                    let sleep = tokio::time::sleep(Duration::from_secs(2));
-                    tokio::select! {
-                        /* workaround for https://github.com/webrtc-rs/webrtc/issues/614 */
-                        _ = sleep => continue,
-                        c = listener.accept() => match c {
-                            Ok((conn, addr)) => {
-                                log::info!("dtls client connected, ip: {addr}");
-                                let mut conns = conns_clone.lock().await;
-                                conns.push((addr, conn.clone()));
-                                let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
-                                let certs = dtls_conn.connection_state().await.peer_certificates;
-                                let cert = certs.first().expect("cert");
-                                let fingerprint = crypto::generate_fingerprint(cert);
-                                listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
-                                spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone()));
-                            },
-                            Err(e) => {
-                                if let Error::Std(ref e) = e {
-                                    if let Some(e) = e.0.downcast_ref::<webrtc_dtls::Error>() {
-                                        match e {
-                                            webrtc_dtls::Error::ErrVerifyDataMismatch => {
-                                                if let Some(fingerprint) = connection_attempts.lock().expect("lock").pop_front() {
-                                                    listen_tx.send(ListenEvent::Rejected { fingerprint }).expect("channel closed");
-                                                }
-                                            }
-                                            _ => log::warn!("accept: {e}"),
+                    let outcome = {
+                        let mut accept = listener.accept();
+                        loop {
+                            tokio::select! {
+                                _ = tick.tick() => continue,
+                                c = &mut accept => break match c {
+                                    Ok((conn, addr)) => {
+                                        log::info!("dtls client connected, ip: {addr}");
+                                        {
+                                            let mut conns = conns_clone.lock().await;
+                                            conns.push((addr, conn.clone()));
                                         }
-                                    } else {
-                                        log::warn!("accept: {e:?}");
+                                        if let Some(dtls_conn) = conn.as_any().downcast_ref::<DTLSConn>() {
+                                            let certs = dtls_conn.connection_state().await.peer_certificates;
+                                            if let Some(cert) = certs.first() {
+                                                let fingerprint = crypto::generate_fingerprint(cert);
+                                                listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
+                                            }
+                                        }
+                                        spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone()));
+                                        None
                                     }
-                                } else {
-                                    log::warn!("accept: {e:?}");
-                                }
+                                    Err(e) => {
+                                        if let Error::Std(ref e) = e {
+                                            if let Some(e) = e.0.downcast_ref::<webrtc_dtls::Error>() {
+                                                match e {
+                                                    webrtc_dtls::Error::ErrVerifyDataMismatch => {
+                                                        if let Some(fingerprint) = connection_attempts.lock().expect("lock").pop_front() {
+                                                            listen_tx.send(ListenEvent::Rejected { fingerprint }).expect("channel closed");
+                                                        }
+                                                    }
+                                                    _ => log::warn!("accept: {e}"),
+                                                }
+                                            } else {
+                                                log::warn!("accept: {e:?}");
+                                            }
+                                        } else {
+                                            log::warn!("accept: {e:?}");
+                                        }
+                                        None
+                                    }
+                                },
+                                port = request_port_change_rx.recv() => {
+                                    break Some(port.expect("channel closed"))
+                                },
                             }
-                        },
-                        port = request_port_change_rx.recv() => {
-                            let port = port.expect("channel closed");
-                            let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
-                            match listen(listen_addr, cfg.clone()).await {
-                                Ok(new_listener) => {
-                                    let _ = listener.close().await;
-                                    listener = new_listener;
-                                    port_changed_tx.send(Ok(port)).expect("channel closed");
-                                }
-                                Err(e) => {
-                                    log::warn!("unable to change port: {e}");
-                                    port_changed_tx.send(Err(e.into())).expect("channel closed");
-                                }
-                            };
-                        },
+                        }
                     };
+
+                    // A port change invalidates the listener the accept future
+                    // was polling; the future is already dropped here.
+                    if let Some(port) = outcome {
+                        let listen_addr =
+                            SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
+                        match listen(listen_addr, cfg.clone()).await {
+                            Ok(new_listener) => {
+                                let _ = listener.close().await;
+                                listener = new_listener;
+                                port_changed_tx.send(Ok(port)).expect("channel closed");
+                            }
+                            Err(e) => {
+                                log::warn!("unable to change port: {e}");
+                                port_changed_tx.send(Err(e.into())).expect("channel closed");
+                            }
+                        };
+                    }
                 }
             })
         };
@@ -273,11 +294,12 @@ async fn read_loop(
         }
     }
     log::info!("dtls client disconnected {addr:?}");
+    // The entry may already be gone (duplicate address after a reconnect, or
+    // teardown racing this loop). Release builds use `panic = "abort"`, so an
+    // `expect` here would kill the process instead of closing one connection.
     let mut conns = conns.lock().await;
-    let index = conns
-        .iter()
-        .position(|(a, _)| *a == addr)
-        .expect("connection not found");
-    conns.remove(index);
+    if let Some(index) = conns.iter().position(|(a, _)| *a == addr) {
+        conns.remove(index);
+    }
     Ok(())
 }

@@ -18,11 +18,11 @@ use lan_mouse_cli::CliError;
 #[cfg(feature = "gtk")]
 use lan_mouse_gtk::GtkError;
 use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
-use std::{
-    future::Future,
-    io,
-    process::{self, Child},
-};
+#[cfg(feature = "gtk")]
+use std::process::Child;
+#[cfg(all(windows, feature = "gtk"))]
+use std::time::Duration;
+use std::{future::Future, io, process};
 use thiserror::Error;
 use tokio::task::LocalSet;
 
@@ -102,6 +102,20 @@ fn run() -> Result<(), LanMouseError> {
                         }
                         service.wait()?;
                     }
+                    #[cfg(windows)]
+                    {
+                        // The daemon exits on its own once its frontend
+                        // disconnects, which lets it flush the peer release
+                        // notice first. Only force it if it overstays.
+                        match wait_for_exit(service, Duration::from_secs(5)) {
+                            true => log::debug!("service exited gracefully"),
+                            false => {
+                                log::warn!("service did not exit in time, killing it");
+                                service.kill()?;
+                            }
+                        }
+                    }
+                    #[cfg(not(any(unix, windows)))]
                     service.kill()?;
                 }
                 res?;
@@ -137,6 +151,26 @@ where
     Ok(runtime.block_on(LocalSet::new().run_until(f))?)
 }
 
+/// Wait up to `timeout` for `child` to exit. Returns whether it exited.
+#[cfg(all(windows, feature = "gtk"))]
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => return false,
+            Err(e) => {
+                log::warn!("could not poll service status: {e}");
+                return false;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "gtk")]
 fn start_service() -> Result<Child, io::Error> {
     let child = process::Command::new(std::env::current_exe()?)
         .args(std::env::args().skip(1))
