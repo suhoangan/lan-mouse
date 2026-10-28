@@ -360,7 +360,7 @@ impl ProtoEvent {
         if bytes.is_empty() {
             return Vec::new();
         }
-        let total = ((bytes.len() + MAX_CLIPBOARD_CHUNK - 1) / MAX_CLIPBOARD_CHUNK) as u16;
+        let total = bytes.len().div_ceil(MAX_CLIPBOARD_CHUNK) as u16;
         let mut events = Vec::with_capacity(total as usize);
         for (i, chunk) in bytes.chunks(MAX_CLIPBOARD_CHUNK).enumerate() {
             let mut data = [0u8; MAX_CLIPBOARD_CHUNK];
@@ -404,10 +404,8 @@ impl ClipboardAssembler {
         }
         if self.chunks.iter().all(|c| c.is_some()) {
             let mut full = Vec::new();
-            for c in self.chunks.drain(..) {
-                if let Some(chunk) = c {
-                    full.extend_from_slice(&chunk);
-                }
+            for chunk in self.chunks.drain(..).flatten() {
+                full.extend_from_slice(&chunk);
             }
             self.total = 0;
             String::from_utf8(full).ok()
