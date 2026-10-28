@@ -1,0 +1,52 @@
+schema: spec-driven
+
+# Project context (optional)
+# Add only constraints that should guide OpenSpec artifacts and workflows.
+# Include constraints an agent cannot infer by reading the code.
+# Keep general project documentation and discoverable codebase facts out.
+# Example:
+#   context: |
+#     Designs and tasks must cover Windows, macOS, and Linux
+#     Write all artifacts in Spanish
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always state what is out of scope
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
+
+# ── added by spec-stack ────────────────────────────────────────────
+context: |
+  Project: <one line>. Stack: <...>. Key dirs: <...>.
+  Conventions: <3-5 short rules>.
+  Know the code cheaply, in this order:
+  1. code-review-graph get_minimal_context_tool(task=<the change>, detail_level="minimal"); go deeper only if needed.
+  2. claude-mem search for past decisions in this area.
+  Never read whole folders; let the graph point to exact files.
+
+rules:
+  design:
+    - List affected callers and dependents from code-review-graph get_impact_radius_tool.
+  tasks:
+    - One task per affected module, including its tests.
+
+operations:
+  apply:
+    guidance:
+      - Before finishing, run code-review-graph detect_changes_tool and close any test gaps it reports.

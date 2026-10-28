@@ -273,10 +273,17 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
+        let mut ack_deadline: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 event = capture.next() => match event {
-                    Some(event) => self.handle_capture_event(capture, event?).await?,
+                    Some(event) => {
+                        let is_begin = matches!(&event, Ok((_, CaptureEvent::Begin)));
+                        self.handle_capture_event(capture, event?).await?;
+                        if is_begin && self.active_client.is_some() && self.state == State::WaitingForAck {
+                            ack_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(1500));
+                        }
+                    }
                     None => return Ok(()),
                 },
                 (handle, event) = self.conn.recv() => {
@@ -293,6 +300,7 @@ impl CaptureTask {
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
+                            ack_deadline = None;
                             if let Some(text) = crate::clipboard::get_text_if_changed() {
                                 log::info!("syncing clipboard to client {handle} ({} bytes)", text.len());
                                 for chunk in ProtoEvent::clipboard_chunks(&text) {
@@ -304,6 +312,7 @@ impl CaptureTask {
                         ProtoEvent::Leave(_) => {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
+                            ack_deadline = None;
                         },
                         ProtoEvent::Clipboard { seq, total, len, data } => {
                             if let Some(text) = self.clipboard_assembler.push(seq, total, len, &data) {
@@ -316,7 +325,10 @@ impl CaptureTask {
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
-                    CaptureRequest::Release => self.release_capture(capture).await?,
+                    CaptureRequest::Release => {
+                        ack_deadline = None;
+                        self.release_capture(capture).await?;
+                    }
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
@@ -330,6 +342,7 @@ impl CaptureTask {
                         // `cli deactivate` (or a hostname change
                         // re-creating the client) would skip leave_hook.
                         if self.active_client == Some(h) {
+                            ack_deadline = None;
                             self.release_capture(capture).await?;
                         }
                         self.remove_capture(h);
@@ -339,9 +352,15 @@ impl CaptureTask {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
                 },
-                _ = tokio::time::sleep(Duration::from_millis(1500)), if self.state == State::WaitingForAck && self.active_client.is_some() => {
+                _ = async {
+                    match ack_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     log::warn!("connection to client timed out waiting for Ack, releasing capture");
                     self.release_capture(capture).await?;
+                    ack_deadline = None;
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }

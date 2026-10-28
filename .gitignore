@@ -12,3 +12,6 @@ extfile.conf
 # flatpak files
 .flatpak-builder
 repo
+# Added by code-review-graph
+.code-review-graph/
+.claude/settings.json.bak

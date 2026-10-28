@@ -286,22 +286,8 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     /* next event is the first actual event */
     let ret = ACTIVE_CLIENT.get().is_some();
 
-    /* if client is active, check if user pulled the cursor back into the local display */
-    if let Some(pos) = ACTIVE_CLIENT.get() {
-        let (ex, ey) = ENTRY_POINT.get();
-        const RETURN_THRESHOLD: i32 = 10;
-        let pulled_back = match pos {
-            Position::Right => curr_pos.0 < ex - RETURN_THRESHOLD,
-            Position::Left => curr_pos.0 > ex + RETURN_THRESHOLD,
-            Position::Bottom => curr_pos.1 < ey - RETURN_THRESHOLD,
-            Position::Top => curr_pos.1 > ey + RETURN_THRESHOLD,
-        };
-        if pulled_back {
-            log::info!("cursor pulled back into local display, releasing active client {pos}");
-            ACTIVE_CLIENT.take();
-            ACCUMULATED_MOTION.set((0.0, 0.0));
-            return false;
-        }
+    /* client already active, no need to check */
+    if ACTIVE_CLIENT.get().is_some() {
         return ret;
     }
 
